@@ -1,0 +1,1492 @@
+import re
+import sys
+import os
+import shutil
+import json
+import array
+import subprocess
+
+import pandas
+import pysam
+import numpy
+from collections import Counter
+
+from sklearn.preprocessing import MultiLabelBinarizer
+
+from untangler_modules.constants import PYSAM_MOD_CODES, PYSAM_MOD_TUPLES
+from untangler_modules.utils import process_input_files, process_annotation_file
+
+from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
+from scipy.spatial.distance import pdist
+from scipy.stats import fisher_exact
+
+from matplotlib import pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib import cm
+import matplotlib
+
+from statsmodels.stats.multitest import multipletests
+
+RANDOM_SEED = 42
+numpy.random.seed(RANDOM_SEED)
+
+def timeit(func):
+    @wraps(func)
+    def _wrapped(*args, **kwargs):
+        t0 = time.perf_counter()
+        res = func(*args, **kwargs)
+        t1 = time.perf_counter()
+        print(f"{func.__name__} took {t1-t0:.3f}s")
+        return res
+    return _wrapped
+
+def sanitize(tok):
+    # keep names filesystem/column-friendly: no spaces, slashes, etc.
+    return re.sub(r"[^0-9a-zA-Z_]+", "-", tok)
+
+
+def classify_bed_interval(gff_df, annotation_row, feature_name, start, end):
+    """Classify a token interval relative to its selected GFF feature."""
+    if feature_name == "introns":
+        return "intron"
+
+    seq_id = annotation_row["seq_id"]
+    gene_id = str(annotation_row["ID"])
+    related_rows = gff_df[gff_df["seq_id"].astype(str) == str(seq_id)]
+
+    # Follow GFF Parent links so CDS/UTR descendants of the selected feature
+    # are included in the classification.
+    if "Parent" in related_rows.columns:
+        selected_ids = {gene_id}
+        changed = True
+        while changed:
+            changed = False
+            for _, candidate in related_rows.iterrows():
+                parents = {
+                    parent.strip()
+                    for parent in str(candidate.get("Parent", "")).split(",")
+                    if parent.strip() and parent.strip() != "nan"
+                }
+                if parents & selected_ids:
+                    candidate_id = str(candidate.get("ID", ""))
+                    if candidate_id and candidate_id not in selected_ids:
+                        selected_ids.add(candidate_id)
+                        changed = True
+
+        related_rows = related_rows[
+            related_rows["ID"].astype(str).isin(selected_ids)
+        ]
+
+    overlap = (
+        (related_rows["start"] - 1 < end)
+        & (related_rows["end"] >= start)
+    )
+    overlapping_types = set(related_rows.loc[overlap, "type"].astype(str).str.lower())
+
+    if "cds" in overlapping_types:
+        return "CDS"
+    if "utr" in overlapping_types or any("utr" in value for value in overlapping_types):
+        return "UTR"
+
+    gene_start = int(annotation_row["start"]) - 1
+    gene_end = int(annotation_row["end"])
+    if start >= gene_start and end <= gene_end:
+        return "intron"
+    return "unmapped"
+
+
+def cluster_order_key(cluster_label):
+    """Return a stable ordering key so cluster names are written as cluster0, cluster1, ..."""
+    text = str(cluster_label)
+    match = re.match(r"^cluster(\d+)", text)
+    if match:
+        return (0, int(match.group(1)), text)
+    return (1, text)
+
+
+def merge_small_clusters_tree_aware(labels, Z, min_size, weights=None):
+    """
+    Tree-aware version: a small cluster is only ever merged into its
+    nearest neighbor AS DEFINED BY THE DENDROGRAM (its sibling subtree
+    at the point it first joins something else) — never into a cluster
+    on a completely different branch, even if that cluster happens to
+    be closer by raw distance.
+    """
+    labels = labels.copy()
+    n = len(labels)  # number of leaves == number of unique patterns
+
+    if weights is None:
+        weights = {i: 1 for i in range(n)}
+
+    # --- Precompute tree structure from Z (iterative, no recursion) ---
+    children = {}
+    for i in range(len(Z)):
+        l, r = int(Z[i, 0]), int(Z[i, 1])
+        children[n + i] = (l, r)
+
+    leaves_under = [None] * (2 * n - 1)
+    for i in range(n):
+        leaves_under[i] = frozenset([i])
+    for i in range(len(Z)):
+        l, r = int(Z[i, 0]), int(Z[i, 1])
+        leaves_under[n + i] = leaves_under[l] | leaves_under[r]
+
+    parent = [None] * (2 * n - 1)
+    for i in range(len(Z)):
+        l, r = int(Z[i, 0]), int(Z[i, 1])
+        node = n + i
+        parent[l] = node
+        parent[r] = node
+
+    # Map each exact leaf-set to the node representing it (only valid for
+    # nodes that ARE pure subtrees — every node in a tree qualifies).
+    leafset_to_node = {leaves_under[node]: node for node in range(2 * n - 1)}
+
+    def cluster_weight_map():
+        w = {}
+        for cl in numpy.unique(labels):
+            idx = numpy.where(labels == cl)[0]
+            w[cl] = sum(weights.get(i, 1) for i in idx)
+        return w
+
+    while True:
+        cluster_weights = cluster_weight_map()
+        small_clusters = [cl for cl, w in cluster_weights.items() if w < min_size]
+
+        if not small_clusters:
+            break
+        if len(cluster_weights) <= 1:
+            break
+
+        small_cl = min(small_clusters, key=lambda cl: cluster_weights[cl])
+        idx_small = numpy.where(labels == small_cl)[0]
+
+        node = leafset_to_node.get(frozenset(idx_small.tolist()))
+
+        if node is None:
+            # Small cluster's members no longer form a pure subtree
+            # (can happen after a few merges). Fall back to nearest
+            # currently-existing ancestor subtree that fully contains it.
+            candidate_nodes = [
+                nd for nd, leafset in enumerate(leaves_under)
+                if set(idx_small.tolist()) <= leafset
+            ]
+            node = min(candidate_nodes, key=lambda nd: len(leaves_under[nd])) if candidate_nodes else None
+
+        target_label = None
+        if node is not None and parent[node] is not None:
+            parent_node = parent[node]
+            l, r = children[parent_node]
+            sibling = r if l == node else l
+            sibling_leaves = leaves_under[sibling]
+
+            label_weights = {}
+            for i in sibling_leaves:
+                lbl = labels[i]
+                if lbl == small_cl:
+                    continue  # ignore any of the small cluster's own leaves if present
+                label_weights[lbl] = label_weights.get(lbl, 0) + weights.get(i, 1)
+
+            if label_weights:
+                target_label = max(label_weights, key=label_weights.get)
+
+        if target_label is None:
+            # No usable sibling (e.g. hit the root, or sibling is entirely
+            # the same small cluster) — nothing left to merge into.
+            break
+
+        labels[idx_small] = target_label
+
+    return labels
+
+
+def find_mutually_exclusive_pairs(rows, allowed_tokens=None, target_prefixes=None,
+                                    predictor_prefixes=None, min_individual_count=5):
+    """
+    Rank token pairs by mutual exclusivity, prioritizing pairs that are
+    BOTH reasonably common individually AND never (or almost never)
+    co-occur — rather than pairs that just happen to have few reads.
+
+    Returns a dataframe sorted with the most exclusive pairs first.
+    """
+    if allowed_tokens is not None:
+        rows = [[t for t in tokens if t in allowed_tokens] for tokens in rows]
+
+    mlb_full = MultiLabelBinarizer()
+    X_full = mlb_full.fit_transform(rows)
+    tokens = numpy.array(mlb_full.classes_)
+    n_reads = len(rows)
+
+    target_idx = [i for i, t in enumerate(tokens) if target_prefixes is None or t.startswith(target_prefixes)]
+    predictor_idx_all = [i for i, t in enumerate(tokens) if predictor_prefixes is None or t.startswith(predictor_prefixes)]
+
+    results = []
+    for ti in target_idx:
+        for pi in predictor_idx_all:
+            if ti == pi:
+                continue
+
+            a = X_full[:, ti]
+            b = X_full[:, pi]
+
+            n_a = int(a.sum())
+            n_b = int(b.sum())
+            n_both = int(((a == 1) & (b == 1)).sum())
+
+            # both tokens need to individually be common enough to be meaningful
+            if n_a < min_individual_count or n_b < min_individual_count:
+                continue
+
+            # expected co-occurrence under independence
+            expected_both = (n_a * n_b) / n_reads
+
+            # exclusivity score: how far actual co-occurrence falls short of
+            # what you'd expect by chance, normalized by expectation.
+            # 1.0 = perfectly exclusive (0 actual vs some expected)
+            # 0.0 = exactly as expected by chance
+            # negative = co-occurring MORE than expected
+            exclusivity_score = (expected_both - n_both) / expected_both if expected_both > 0 else numpy.nan
+
+            table = [[n_both, n_a - n_both], [n_b - n_both, n_reads - n_a - n_b + n_both]]
+            _, p = fisher_exact(table)
+
+            results.append({
+                "token_a": tokens[ti],
+                "token_b": tokens[pi],
+                "n_a": n_a,
+                "n_b": n_b,
+                "n_both": n_both,
+                "expected_both": round(expected_both, 2),
+                "exclusivity_score": exclusivity_score,
+                "p_value": p,
+            })
+
+    if not results:
+        return pandas.DataFrame()
+
+    res_df = pandas.DataFrame(results)
+    # dedupe symmetric pairs (a,b) and (b,a) if target/predictor prefixes overlap
+    res_df["pair_key"] = res_df.apply(lambda r: tuple(sorted([r["token_a"], r["token_b"]])), axis=1)
+    res_df = res_df.drop_duplicates("pair_key").drop(columns="pair_key")
+
+    res_df["p_adj"] = multipletests(res_df["p_value"], method="fdr_bh")[1]
+    res_df = res_df.sort_values(["n_both", "exclusivity_score"], ascending=[True, False])
+
+    return res_df
+
+def collapse_redundant_predictor_combos(res_df, lift_col="lift_combo_absent",
+                                          tolerance=0.05, group_col="intron"):
+    """
+    For each target (e.g. intron), collapse overlapping predictor
+    combinations down to non-redundant ones. If a larger combo is a
+    superset of an already-kept simpler one AND meaningfully improves
+    on it, the simpler one is REMOVED (superseded) — only the larger,
+    better combo is kept. If the larger combo does NOT improve
+    meaningfully, IT is dropped instead, and the simpler one stays.
+    """
+    keep_rows = {}  # keyed by frozenset(tokens) -> (row, lift), acts as running "kept" set
+
+    if group_col not in res_df.columns:
+        return res_df
+
+    for target, group in res_df.groupby(group_col):
+        group = group.sort_values("n_predictor_tokens")  # simplest first
+        kept = []  # list of dicts: {"tokens": set, "lift": float, "row": Series}
+
+        for _, row in group.iterrows():
+            this_tokens = set(row["predictor_combo"].split(" | "))
+            this_lift = row[lift_col]
+
+            # find any already-kept combo that this one is a superset of
+            superseded = []
+            is_redundant = False
+
+            for k in kept:
+                if k["tokens"].issubset(this_tokens) and k["tokens"] != this_tokens:
+                    if this_lift > k["lift"] * (1 + tolerance):
+                        # this combo meaningfully improves on the simpler kept one
+                        # -> the simpler one is now superseded, mark for removal
+                        superseded.append(k)
+                    else:
+                        # this combo does NOT meaningfully improve -> it's the redundant one
+                        is_redundant = True
+                        break
+
+            if is_redundant:
+                continue
+
+            # remove any kept combos this one superseded
+            for s in superseded:
+                kept.remove(s)
+
+            kept.append({"tokens": this_tokens, "lift": this_lift, "row": row})
+
+        keep_rows[target] = [k["row"] for k in kept]
+
+    all_rows = [row for rows in keep_rows.values() for row in rows]
+    return pandas.DataFrame(all_rows)
+
+def _get_m6a_position(token):
+    """Extract the integer position from an 'm6A_<pos>' token."""
+    return int(token.split("_", 1)[1])
+
+
+def _get_intron_range(token):
+    """Extract (start, end) ints from an 'introns_<start>-<end>' token."""
+    coords = token.split("_", 1)[1]
+    start_str, end_str = coords.split("-")
+    return int(start_str), int(end_str)
+
+
+def _within_distance_of_intron(predictor_token, intron_token, max_distance_nt):
+    """
+    True if predictor_token's position is within max_distance_nt of the
+    intron's boundaries (0 if the predictor falls inside the intron span
+    itself). Non-m6A / unparseable predictor tokens are always kept
+    (distance filtering only applies to positional m6A predictors).
+    """
+    if max_distance_nt is None:
+        return True
+    if not predictor_token.startswith("m6A_"):
+        return True
+
+    try:
+        pos = _get_m6a_position(predictor_token)
+        start, end = _get_intron_range(intron_token)
+    except (ValueError, IndexError):
+        return True  # can't parse -> don't filter it out
+
+    if pos < start:
+        dist = start - pos
+    elif pos > end:
+        dist = pos - end
+    else:
+        dist = 0  # inside the intron span
+
+    return dist <= max_distance_nt
+
+
+def plot_cluster_dendrogram(
+    Z,
+    unique_rows,
+    unique_labels_arr,
+    pattern_counts,
+    cluster_names,
+    distance_threshold,
+    hide_labels=False,
+    delay_show=False
+):
+    """Plot a dendrogram from clustering results."""
+    n_leaves = len(unique_rows)
+    if n_leaves < 2:
+        print(f"Skipping dendrogram: only {n_leaves} unique pattern(s)")
+        return
+
+    sys.setrecursionlimit(max(1000, n_leaves + 10))
+    cluster_ids_sorted = sorted(set(unique_labels_arr))
+    cmap = matplotlib.colormaps["tab20"].resampled(len(cluster_ids_sorted))
+    cluster_color_map = {
+        cid: cm.colors.to_hex(cmap(i)) for i, cid in enumerate(cluster_ids_sorted)
+    }
+    node_cluster_ids = {i: {unique_labels_arr[i]} for i in range(n_leaves)}
+    for i, (left, right, _, _) in enumerate(Z):
+        node_id = n_leaves + i
+        node_cluster_ids[node_id] = (
+            node_cluster_ids[int(left)] | node_cluster_ids[int(right)]
+        )
+
+    def link_color_func(node_id):
+        ids = node_cluster_ids[node_id]
+        return cluster_color_map[next(iter(ids))] if len(ids) == 1 else "#808080"
+
+    ddata = dendrogram(
+        Z,
+        labels=[", ".join(unique_rows[i]) for i in range(n_leaves)],
+        no_labels=hide_labels,
+        link_color_func=link_color_func,
+    )
+    plt.ylabel("Jaccard distance")
+    plt.axhline(y=distance_threshold, color="red", linestyle="--", label="distance threshold")
+
+    ax = plt.gca()
+    for tick_label, orig_idx in zip(ax.get_xticklabels(), ddata["leaves"]):
+        tick_label.set_color(cluster_color_map[unique_labels_arr[orig_idx]])
+
+    for pos, orig_idx in enumerate(ddata["leaves"]):
+        ax.plot(
+            5 + 10 * pos,
+            0,
+            marker="s",
+            markersize=4,
+            color=cluster_color_map[unique_labels_arr[orig_idx]],
+            clip_on=False,
+        )
+
+    cluster_row_counts = Counter()
+    for i, cid in enumerate(unique_labels_arr):
+        cluster_row_counts[cid] += pattern_counts.get(i, 0)
+
+    ax.legend(
+        handles=[
+            mpatches.Patch(
+                color=cluster_color_map[cid],
+                label=f"(n={cluster_row_counts[cid]}) {cluster_names.get(cid, f'cluster_{cid}')}",
+            )
+            for cid in cluster_ids_sorted
+        ],
+        loc="lower left",
+        bbox_to_anchor=(0, 1.02),
+        fontsize=8,
+        title="Cluster",
+    )
+    plt.xlabel("")
+    plt.subplots_adjust(left=0.08, right=0.98, bottom=0.25, top=0.78)
+    if not delay_show:
+        plt.show()
+
+
+def evaluate_cluster_tokens_as_target_predictors(rows, cluster_important_tokens, target_prefix, min_count,
+                                                    LIFT_THRESHOLD, max_distance_nt=None):
+    """
+    For each UNIQUE combination of non-intron predictor tokens across all
+    clusters (deduplicated), test the union ("has any of these tokens")
+    against EVERY intron token found across ALL clusters — but for each
+    (predictor_combo, intron) pair, ONLY predictor tokens within
+    max_distance_nt of that specific intron's boundaries are included in
+    the union. Predictor tokens too far from a given intron are dropped
+    for that intron's test (they may still be used for other, nearer
+    introns).
+
+    Parameters
+    ----------
+    max_distance_nt : int or None
+        Maximum distance (nt) an m6A predictor token may be from an
+        intron's start/end to be considered for that intron's test.
+        None disables distance filtering entirely (original behavior).
+
+    Returns
+    -------
+    pandas.DataFrame, one row per (predictor_combo, intron) pair, with
+    the same columns as before, plus n_predictor_tokens now reflecting
+    the DISTANCE-FILTERED predictor count actually used for that test.
+    """
+    mlb = MultiLabelBinarizer()
+    X = mlb.fit_transform(rows)
+    tokens = numpy.array(mlb.classes_)
+    tok_to_idx = {t: i for i, t in enumerate(tokens)}
+    n_reads = len(rows)
+
+    all_target_tokens = sorted({
+        tok for imp_tokens in cluster_important_tokens.values()
+        for tok in imp_tokens if tok.startswith(target_prefix)
+    })
+
+    if not all_target_tokens:
+        print(f"No target tokens {target_prefix} found among any cluster's important tokens.")
+        return pandas.DataFrame()
+
+    # --- deduplicate predictor sets across clusters (full set, before distance filtering) ---
+    combo_to_clusters = {}
+    for cid, imp_tokens in cluster_important_tokens.items():
+        predictor_tokens = frozenset(t for t in imp_tokens if not t.startswith(target_prefix) and t in tok_to_idx)
+        if not predictor_tokens:
+            continue
+        combo_to_clusters.setdefault(predictor_tokens, []).append(cid)
+
+    results = []
+    for predictor_set, cids in combo_to_clusters.items():
+        for target_tok in all_target_tokens:
+            if target_tok not in tok_to_idx:
+                continue
+
+            # --- filter predictors to those near THIS intron ---
+            filtered_predictor_tokens = sorted(
+                t for t in predictor_set
+                if _within_distance_of_intron(t, target_tok, max_distance_nt)
+            )
+            if not filtered_predictor_tokens:
+                continue  # nothing left close enough to this intron -> skip this pair
+
+            pred_idx = [tok_to_idx[t] for t in filtered_predictor_tokens]
+            p_combo = (X[:, pred_idx].sum(axis=1) >= 1).astype(int)
+
+            n_present = int(p_combo.sum())
+            n_absent = n_reads - n_present
+            if n_present < min_count or n_absent < min_count:
+                continue
+
+            y = X[:, tok_to_idx[target_tok]]
+            p_target_overall = y.mean()
+            if p_target_overall == 0:
+                continue
+
+            p_target_given_present = y[p_combo == 1].mean()
+            p_target_given_absent = y[p_combo == 0].mean()
+
+            lift_present = p_target_given_present / p_target_overall
+            lift_absent = p_target_given_absent / p_target_overall
+
+            n11 = int(((y == 1) & (p_combo == 1)).sum())
+            n10 = int(((y == 1) & (p_combo == 0)).sum())
+            n01 = int(((y == 0) & (p_combo == 1)).sum())
+            n00 = int(((y == 0) & (p_combo == 0)).sum())
+            _, p_value = fisher_exact([[n11, n10], [n01, n00]])
+
+            results.append({
+                "clusters": ", ".join(str(c) for c in sorted(cids, key=str)),
+                "predictor_combo": " | ".join(filtered_predictor_tokens),
+                "n_predictor_tokens": len(filtered_predictor_tokens),
+                "target": target_tok,
+                "p_target_overall": p_target_overall,
+                "p_target_given_combo_present": p_target_given_present,
+                "lift_combo_present": lift_present,
+                "p_target_given_combo_absent": p_target_given_absent,
+                "lift_combo_absent": lift_absent,
+                "p_value": p_value,
+            })
+
+    res_df = pandas.DataFrame(results)
+    if len(res_df) > 0:
+        INV_LIFT_THRESHOLD = 1 / LIFT_THRESHOLD
+
+        res_df["p_adj"] = multipletests(res_df["p_value"], method="fdr_bh")[1]
+
+        res_df = res_df[
+            (res_df["p_adj"] < 0.05) &
+            (res_df["lift_combo_absent"] >= LIFT_THRESHOLD) &
+            (res_df["lift_combo_present"] <= INV_LIFT_THRESHOLD)
+        ].sort_values("lift_combo_absent", ascending=False)
+
+        res_df = res_df.sort_values("target")
+
+    return res_df
+
+
+# https://uc-r.github.io/hc_clustering
+def run_pairwise_clustering(df, feature_cols, min_support, distance_threshold=0.1, min_feature_freq=0.01, LIFT_THRESHOLD=1.5, FEATURE_DISTANCE_THRESHOLD=100, distance_metric="jaccard", linkage_method="average", predict_column=None):
+    rows_of_tokens = []
+
+    for _, row in df.iterrows():
+        tokens = []
+        for col in feature_cols:
+            if col == "introns":
+                for value in row.get(col, []) or []:
+                    start, end = value
+                    tokens.append(f"{col}_{start}-{end}")
+            else:
+                for value in row.get(col, []) or []:
+                    tokens.append(f"{col}_{value}")
+        rows_of_tokens.append(tokens)
+
+    # --- Drop rare features: keep only tokens present in >= min_feature_freq of reads ---
+    min_token_rows = int(numpy.ceil(min_feature_freq * len(df)))
+    token_row_counts = Counter()
+    for tokens in rows_of_tokens:
+        for t in set(tokens):  # count once per row, even if repeated within a row
+            token_row_counts[t] += 1
+
+    keep_tokens = {t for t, c in token_row_counts.items() if c >= min_token_rows}
+    rows = [[t for t in tokens if t in keep_tokens] for tokens in rows_of_tokens]
+
+    # --- Deduplicate: cluster unique patterns
+    pattern_key = [tuple(sorted(set(tokens))) for tokens in rows]
+    unique_patterns = sorted(set(pattern_key))
+    pattern_to_uid = {p: i for i, p in enumerate(unique_patterns)}
+    row_to_uid = numpy.array([pattern_to_uid[p] for p in pattern_key])
+
+    unique_rows = [list(p) for p in unique_patterns]
+
+    mlb = MultiLabelBinarizer()
+    X = mlb.fit_transform(unique_rows)
+    dists = pdist(X, metric=distance_metric)
+    Z = linkage(dists, method=linkage_method)
+
+    # Extract the distances (heights) from the linkage matrix
+    distances = Z[:, 2]
+
+    # # Plot the elbow-style curve of merge distances
+    # sorted_distances = sorted(distances, reverse=True)
+    # plt.plot(range(1, len(sorted_distances) + 1), sorted_distances, marker="o")
+    # plt.title("Elbow Plot for Hierarchical Clustering")
+    # plt.xlabel("Merge Step / Number of Clusters")
+    # plt.ylabel("Merge Distance")
+    # plt.show()
+
+    # Find the elbow point in the dendrogram
+    last_n = 15
+    last_n = min(last_n, len(distances) - 1)
+    recent = distances[-last_n:]
+
+    if distance_threshold == 0:
+        diffs = numpy.diff(recent)
+        # index of largest jump
+        jump_idx = numpy.argmax(diffs)
+
+        # Threshold: just above the height before the big jump
+        threshold = recent[jump_idx]
+        print(f"Suggested distance threshold (elbow method): {threshold:.4f}")
+    else:
+        threshold = distance_threshold
+
+    unique_labels_arr = fcluster(Z, t=threshold, criterion="distance")
+
+    # --- Enforce minimum cluster size (in terms of ORIGINAL row counts, not unique patterns) ---
+    pattern_counts = Counter(row_to_uid)  # how many original rows each unique pattern represents
+
+    # merge small clusters upward, weighted by how many rows share them
+    if (min_support > 0):
+        unique_labels_arr = merge_small_clusters_tree_aware(
+            unique_labels_arr, Z, min_support, weights=pattern_counts
+        )
+
+    # Map unique-pattern cluster labels back to every original row
+    labels = unique_labels_arr[row_to_uid]
+
+    unique_labels = sorted(set(labels))
+    relabel_map = {old: new for new, old in enumerate(unique_labels)}
+    labels = numpy.array([relabel_map[lbl] for lbl in labels])
+    unique_labels_arr = numpy.array([relabel_map[lbl] for lbl in unique_labels_arr])   # add this
+
+    # --- build descriptive cluster names from top features ---
+    top_n = 10
+
+    min_cluster_freq = 0.5      # token must be present in at least 50% of this cluster's reads
+    min_enrichment = 2.0        # AND at least 2x more frequent in this cluster than elsewhere
+
+    cluster_names = {}
+    cluster_summary = []
+    important_tokens = set()
+
+    n_total = len(rows)
+    global_counts = Counter()
+    for tokens in rows:
+        global_counts.update(set(tokens))
+
+    for cluster_id in sorted(set(labels)):
+        idx = [i for i, lbl in enumerate(labels) if lbl == cluster_id]
+        n_cluster = len(idx)
+
+        counts = Counter()
+        for i in idx:
+            counts.update(set(rows[i]))
+
+        # --- filter to tokens that are actually characteristic of this cluster ---
+        candidates = []
+        for tok, c_in in counts.items():
+            freq_in_cluster = c_in / n_cluster
+
+            c_total = global_counts[tok]
+            c_out = c_total - c_in
+            n_out = n_total - n_cluster
+            freq_outside = c_out / n_out if n_out > 0 else 0.0
+
+            # avoid divide-by-zero when a token is unique to this cluster (freq_outside == 0)
+            enrichment = freq_in_cluster / freq_outside if freq_outside > 0 else numpy.inf
+
+            if freq_in_cluster >= min_cluster_freq and enrichment >= min_enrichment:
+                candidates.append((tok, c_in, freq_in_cluster, enrichment))
+
+        # sort defining tokens by within-cluster frequency (most consistent first)
+        candidates.sort(key=lambda x: x[2], reverse=True)
+
+        top_n = 10
+        top = candidates[:top_n]
+        top_str = ", ".join(f"{tok} ({c}/{n_cluster}, {enr:.1f}x enriched)" for tok, c, freq, enr in top)
+
+        top_tokens_clean = [sanitize(tok) for tok, _, _, _ in top]
+        cluster_name = "_".join([f"cluster{cluster_id}"] + top_tokens_clean) if top_tokens_clean else f"cluster{cluster_id}"
+        cluster_names[cluster_id] = cluster_name
+
+        important_tokens.update(tok for tok, _, _, _ in top)
+
+        cluster_summary.append({
+            "cluster": cluster_name,
+            "n_samples": n_cluster,
+            "top_positions": top_str,
+        })
+
+
+    cluster_important_tokens = {}   # <-- NEW: cluster_id -> list of ALL its defining tokens (not just top_n)
+
+    for cluster_id in sorted(set(labels)):
+        idx = [i for i, lbl in enumerate(labels) if lbl == cluster_id]
+        n_cluster = len(idx)
+
+        counts = Counter()
+        for i in idx:
+            counts.update(set(rows[i]))
+
+        candidates = []
+        for tok, c_in in counts.items():
+            freq_in_cluster = c_in / n_cluster
+            c_total = global_counts[tok]
+            c_out = c_total - c_in
+            n_out = n_total - n_cluster
+            freq_outside = c_out / n_out if n_out > 0 else 0.0
+            enrichment = freq_in_cluster / freq_outside if freq_outside > 0 else numpy.inf
+
+            if freq_in_cluster >= min_cluster_freq and enrichment >= min_enrichment:
+                candidates.append((tok, c_in, freq_in_cluster, enrichment))
+
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        cluster_important_tokens[cluster_id] = [tok for tok, _, _, _ in candidates]   # <-- store ALL, not just top_n
+
+
+    df_out = df.copy()
+    df_out["combined_primary_itemset"] = [cluster_names[int(lbl)] for lbl in labels]
+
+    # --- optional: test for correlated / mutually exclusive feature pairs ---
+    # Here is where we identify sets of features which are good predictors of each other, other co-occuring or mutually exclusive
+    cluster_summary_df = pandas.DataFrame(cluster_summary).sort_values("n_samples", ascending=False).reset_index(drop=True)
+
+    # for each cluster, grab the top tokens and test whether those tokens are better at predicting each intron than the background
+    if predict_column is not None:
+        predictor_results = evaluate_cluster_tokens_as_target_predictors(
+            rows, cluster_important_tokens, predict_column, 5, LIFT_THRESHOLD, FEATURE_DISTANCE_THRESHOLD
+        )
+
+        if not predictor_results.empty:
+            collapsed_predictor_results = collapse_redundant_predictor_combos(
+                predictor_results, lift_col="lift_combo_absent", tolerance=0.05
+            )
+            # 2. Explode "clusters" so each row has ONE cluster_id
+            collapsed_predictor_results["clusters"] = collapsed_predictor_results["clusters"].astype(str)
+            predictor_exploded = collapsed_predictor_results.assign(
+                cluster_id=collapsed_predictor_results["clusters"].str.split(",")
+            ).explode("cluster_id")
+            predictor_exploded["cluster_id"] = predictor_exploded["cluster_id"].str.strip().astype(int)
+            predictor_exploded = predictor_exploded.drop(columns="clusters")
+
+            # 3. Merge onto cluster_summary_df (this WILL produce multiple rows per cluster again — expected)
+            cluster_summary_df["cluster_id"] = cluster_summary_df["cluster"].str.extract(r"^cluster(\d+)")[0].astype(int)
+            merged_long = cluster_summary_df.merge(predictor_exploded, on="cluster_id", how="left")
+
+            # 4. Collapse BACK to one row per cluster, aggregating predictor-result columns into lists
+            list_cols = [c for c in predictor_exploded.columns if c != "cluster_id"]
+            cluster_cols = [c for c in cluster_summary_df.columns if c != "cluster_id"]
+
+            agg_dict = {c: (lambda s: list(s.dropna())) for c in list_cols}
+            agg_dict.update({c: "first" for c in cluster_cols})
+
+            cluster_summary_df = (
+                merged_long
+                .groupby("cluster_id", as_index=False)
+                .agg(agg_dict)
+            )
+
+
+
+    dendrogram_data = {
+        "Z": Z,
+        "unique_rows": unique_rows,
+        "unique_labels_arr": unique_labels_arr,
+        "pattern_counts": pattern_counts,
+        "cluster_names": cluster_names,
+        "keep_tokens": keep_tokens,
+    }
+
+    return df_out, cluster_summary_df, dendrogram_data
+
+def overlap_length(read, region_start, region_end):
+    """Compute how many bp of a read's aligned blocks overlap [region_start, region_end)."""
+    total = 0
+    for block_start, block_end in read.get_blocks():  # aligned (ref-coordinate) blocks, excludes introns/deletions
+        ov_start = max(block_start, region_start)
+        ov_end = min(block_end, region_end)
+        if ov_end > ov_start:
+            total += ov_end - ov_start
+    return total
+
+def gather_read_entries_for_region(
+    row,
+    bam_labels,
+    input_files,
+    bam_handles,
+    COVERAGE_PADDING,
+    MIN_DELETION_LENGTH,
+    MODS,
+    PYSAM_MOD_THRESHOLD,
+    MIN_GENE_OVERLAP
+):
+    """
+    Extract read entries from all BAM labels for a given annotation `row`.
+
+    Returns a list of read_entry lists suitable for constructing the
+    `read_table` DataFrame (same format as the inline loop previously
+    in `cluster_transcripts`).
+    """
+    read_entries = []
+
+    for label in bam_labels:
+        samfile_path = input_files[label]["path"]
+        samfile = bam_handles[label]
+
+        READS_IN_REGION = list(
+            samfile.fetch(
+                contig=row["seq_id"],
+                start=row["start"] - COVERAGE_PADDING,
+                stop=row["end"] + COVERAGE_PADDING,
+            )
+        )
+
+        # TODO, consider a % here
+        if MIN_GENE_OVERLAP > 0:
+            READS_IN_REGION = [
+                read for read in READS_IN_REGION
+                if overlap_length(read, row["start"], row["end"]) >= MIN_GENE_OVERLAP
+            ]
+
+        # filter reads
+        for r in READS_IN_REGION:
+            read_is_forward = r.is_forward
+
+            if r.is_secondary or r.is_supplementary:
+                continue
+            if (row["strand"] == "+" and not read_is_forward) or (
+                row["strand"] == "-" and read_is_forward
+            ):
+                continue
+
+            mod_positions = []
+
+            ref_pos = r.get_reference_positions(full_length=True)
+            mb = r.modified_bases
+
+            read_start = r.reference_start
+            read_end = r.reference_end
+            read_qualities = r.query_qualities
+            read_cigartuples = r.cigartuples
+            read_name = r.query_name
+            read_query_length = r.query_length
+
+            for mod in MODS:
+                if read_is_forward:
+                    pysam_mod_tuple_code = "{}_for".format(mod)
+                else:
+                    pysam_mod_tuple_code = "{}_rev".format(mod)
+
+                genomic_mod_positions = []
+                if pysam_mod_tuple_code in PYSAM_MOD_TUPLES:
+                    mods_probs = mb.get(PYSAM_MOD_TUPLES[pysam_mod_tuple_code]) if mb else None
+
+                    if mods_probs:
+                        # keep only mod positions which are above mod prob threshold
+                        read_mod_positions = [x[0] for x in mods_probs if x[1] >= PYSAM_MOD_THRESHOLD]
+                        genomic_mod_positions = [ref_pos[mod] for mod in read_mod_positions if ref_pos[mod] is not None]
+
+                mod_positions.append(genomic_mod_positions)
+
+            # introns
+            introns = []
+            ref_pos_iter = read_start
+
+            for op, length in read_cigartuples:
+                if op == 2:  # D =
+                    if length >= MIN_DELETION_LENGTH:
+                        introns.append((ref_pos_iter, ref_pos_iter + length))
+
+                if op in (0, 2, 3, 7, 8):  # M, D, N, =, X consume reference
+                    ref_pos_iter += length
+
+            # phred quality
+            avg_quality = (sum(read_qualities) / len(read_qualities)) if read_qualities else 0
+
+            poly_a_length = 0
+            if r.has_tag("pt:i"):
+                poly_a_length = r.get_tag("pt:i")
+
+            read_entry = [
+                read_name,
+                label,
+                # store the threshold used for this run (kept for provenance)
+                PYSAM_MOD_THRESHOLD / 256.0,
+                samfile_path,
+                row["seq_id"],
+                row["ID"],
+                read_start,
+                read_end,
+                "+" if read_is_forward else "-",
+                read_query_length,
+                poly_a_length,
+                avg_quality,
+                introns,
+            ]
+
+            read_entry += mod_positions
+
+            read_entries.append(read_entry)
+
+    return read_entries
+
+    # continuous variable encoding for feature clusters may not work, but for single categories (just m6A) could order by the midpoint/max of modification for position information along the transcript
+
+def cluster_transcripts(args):
+    # general options
+    INPUT = args.input
+    ANNOTATION_FILE = args.annotation
+    GENOME_FILE = args.genome
+    IDS = args.ids
+    FEATURE_TYPE = args.type
+    OUTPUT_DIR = os.path.abspath(os.path.expanduser(args.outfile))
+    CALL_MODS = args.call_mods
+    FORCE = args.force
+    HIDE_DENDROGRAM_LABELS = args.hide_dendrogram_labels
+    SHOW_DENDROGRAM = args.show_dendrogram
+    GENERATE_IGV_REPORT = args.generate_igv_reports
+    SHOW_ALIGNMENTS = args.show_alignments
+
+    # read processing options
+    COVERAGE_PADDING = args.padding
+    MIN_DELETION_LENGTH = args.min_deletion_length
+    CLUSTER_COLS = args.cluster_cols.split(',') if args.cluster_cols is not None else None
+    MIN_GENE_OVERLAP = args.min_gene_overlap
+    MOD_PROB_THRESHOLD = args.mod_prob_threshold
+    PYSAM_MOD_THRESHOLD = int(256 * MOD_PROB_THRESHOLD)
+    MINIMUM_READS_TO_PROCESS = args.min_reads_to_process
+    print("Read processing options:")
+    print(f"  COVERAGE_PADDING: {COVERAGE_PADDING}")
+    print(f"  MIN_DELETION_LENGTH: {MIN_DELETION_LENGTH}")
+    print(f"  CLUSTER_COLS: {CLUSTER_COLS}")
+    print(f"  MIN_GENE_OVERLAP: {MIN_GENE_OVERLAP}")
+    print(f"  MOD_PROB_THRESHOLD: {MOD_PROB_THRESHOLD}")
+    print(f"  MINIMUM_READS_TO_PROCESS: {MINIMUM_READS_TO_PROCESS}")
+
+    print("Clustering options:")
+    MIN_CLUSTER_PERC = args.min_cluster_percent
+    MIN_CLUSTER_SIZE_BULK = args.min_cluster_size_bulk
+    DISTANCE_THRESHOLD = args.distance_threshold
+    MIN_FEATURE_FREQ = args.min_feature_freq
+    DISTANCE_METRIC = args.distance_metric
+    LINKAGE_METHOD = args.linkage_method
+    print(f"  MIN_CLUSTER_PERC: {MIN_CLUSTER_PERC}")
+    print(f"  MIN_CLUSTER_SIZE_BULK: {MIN_CLUSTER_SIZE_BULK}")
+    print(f"  DISTANCE_THRESHOLD: {DISTANCE_THRESHOLD}")
+    print(f"  MIN_FEATURE_FREQ: {MIN_FEATURE_FREQ}")
+    print(f"  DISTANCE_METRIC: {DISTANCE_METRIC}")
+    print(f"  LINKAGE_METHOD: {LINKAGE_METHOD}")
+
+    # Variables for intron prediction
+    print("Intron prediction options:")
+    LIFT_THRESHOLD = args.lift_threshold
+    FEATURE_DISTANCE_THRESHOLD = args.feature_distance_threshold # min distance the two features must be apart to be considered for exclusivity
+    PREDICT_COLUMN = args.predict
+    if PREDICT_COLUMN is not None:
+        print(f"Evaluating cluster tokens as predictors of {PREDICT_COLUMN}...")
+        print(f"  LIFT_THRESHOLD = {LIFT_THRESHOLD}")
+        print(f"  FEATURE_DISTANCE_THRESHOLD = {FEATURE_DISTANCE_THRESHOLD}")
+    
+
+    if OUTPUT_DIR in (os.path.abspath(os.sep), os.path.expanduser("~")):
+        print(f"WARNING: refusing to use a protected output directory: {OUTPUT_DIR}")
+        return
+
+    if os.path.exists(OUTPUT_DIR):
+        if not os.path.isdir(OUTPUT_DIR):
+            print(f"WARNING: output path exists and is not a directory: {OUTPUT_DIR}")
+            return
+        if not FORCE:
+            print(f"WARNING: output directory already exists: {OUTPUT_DIR}")
+            print("Exiting without changing it. Use -f/--force to overwrite it.")
+            return
+        shutil.rmtree(OUTPUT_DIR)
+
+    os.makedirs(OUTPUT_DIR)
+
+    MODS = [m for m in CLUSTER_COLS if m != "introns"]
+
+    # -------------------- begin processing -------------------- # 
+
+    input_files = process_input_files(INPUT)
+    
+    if 'genome' in input_files:
+        GENOME_FILE = os.path.expanduser(input_files['genome']['path'])
+
+    if 'annotation' in input_files:
+        ANNOTATION_FILE = os.path.expanduser(input_files['annotation']['path'])
+
+    # load annotation file and find indexes for all parent children
+    gff_df = process_annotation_file(ANNOTATION_FILE)
+    if COVERAGE_PADDING:
+        gff_df["type"] = gff_df["type"].cat.add_categories(["{}bp".format(COVERAGE_PADDING)])
+
+    if FEATURE_TYPE:
+        matches = gff_df[gff_df['type'] == FEATURE_TYPE]
+    else:
+        matches = gff_df[gff_df['ID'].isin(IDS)]
+    if matches.empty:
+        print("ERROR: no matches found for type {} and ids {}".format(FEATURE_TYPE, IDS))
+
+    print(matches)
+
+    read_table_header = [
+        "read_id",
+        "label",
+        "mod_prob_threshold",
+        "bamfile_path",
+        "contig",
+        "ID",
+        "read_start",
+        "read_end",
+        "read_strand",
+        "read_length",
+        "poly_a_length",
+        "average_quality",
+        "introns"
+    ]
+
+    for mod in MODS:
+        read_table_header.append("{}".format(mod))
+
+    config_path = os.path.join(OUTPUT_DIR, "config.txt")
+    with open(config_path, "w") as config_file:
+        config_file.write("Input files:\n")
+        config_file.write(f"  GENOME_FILE: {GENOME_FILE}\n")
+        config_file.write(f"  ANNOTATION_FILE: {ANNOTATION_FILE}\n")
+        config_file.write("  BAM files:\n")
+        for label, input_file in input_files.items():
+            if input_file["type"] == "bam":
+                config_file.write(f"    {label}: {input_file['path']}\n")
+        config_file.write("Annotation selection:\n")
+        if FEATURE_TYPE:
+            config_file.write(f"  TYPE: {FEATURE_TYPE}\n")
+        else:
+            config_file.write(f"  IDS: {IDS}\n")
+        config_file.write("Read processing options:\n")
+        config_file.write(f"  COVERAGE_PADDING: {COVERAGE_PADDING}\n")
+        config_file.write(f"  MIN_DELETION_LENGTH: {MIN_DELETION_LENGTH}\n")
+        config_file.write(f"  CLUSTER_COLS: {CLUSTER_COLS}\n")
+        config_file.write(f"  MIN_GENE_OVERLAP: {MIN_GENE_OVERLAP}\n")
+        config_file.write(f"  MOD_PROB_THRESHOLD: {MOD_PROB_THRESHOLD}\n")
+        config_file.write(f"  MINIMUM_READS_TO_PROCESS: {MINIMUM_READS_TO_PROCESS}\n")
+        config_file.write("Clustering options:\n")
+        config_file.write(f"  MIN_CLUSTER_PERC: {MIN_CLUSTER_PERC}\n")
+        config_file.write(f"  MIN_CLUSTER_SIZE_BULK: {MIN_CLUSTER_SIZE_BULK}\n")
+        config_file.write(f"  DISTANCE_THRESHOLD: {DISTANCE_THRESHOLD}\n")
+        config_file.write(f"  MIN_FEATURE_FREQ: {MIN_FEATURE_FREQ}\n")
+        config_file.write(f"  DISTANCE_METRIC: {DISTANCE_METRIC}\n")
+        config_file.write(f"  LINKAGE_METHOD: {LINKAGE_METHOD}\n")
+        config_file.write("Intron prediction options:\n")
+        if PREDICT_COLUMN is not None:
+            config_file.write(
+                f"Evaluating cluster tokens as predictors of {PREDICT_COLUMN}...\n"
+            )
+            config_file.write(f"  LIFT_THRESHOLD = {LIFT_THRESHOLD}\n")
+            config_file.write(
+                f"  FEATURE_DISTANCE_THRESHOLD = {FEATURE_DISTANCE_THRESHOLD}\n"
+            )
+
+    print(f"Done. Wrote: {config_path}")
+
+    bam_labels = [l for l in input_files.keys() if input_files[l]['type'] == 'bam']
+
+    # Open once: label -> handle
+    bam_handles = {
+        label: pysam.AlignmentFile(input_files[label]['path'], "rb")
+        for label in bam_labels
+    }
+
+    all_count_tables = []
+    all_cluster_summaries = []
+    feature_bed_records = {feature: set() for feature in CLUSTER_COLS}
+    cluster_bam_writers = {}
+    cluster_bam_read_ids = {}
+
+    # Keep one output BAM per cluster for each input BAM across all annotations.
+    cluster_bam_directories = {}
+    for label in bam_labels:
+        cluster_bam_directories[label] = os.path.join(
+            OUTPUT_DIR,
+            f"{label}_cluster_bams",
+        )
+        os.makedirs(cluster_bam_directories[label], exist_ok=True)
+
+    try:
+        # ------------------- MAIN READ AND FEATURE EXTRACTION LOOP FROM BAMFILES ------------------- #
+        for _, row in matches.iterrows():
+            # if row["seq_id"] != "Pf3D7_12_v3":
+            #     print("skipping {}...".format(row["ID"]))
+            #     continue
+            print("processing {}...".format(row["ID"]))
+            read_entries = []
+
+            read_entries = gather_read_entries_for_region(
+                row,
+                bam_labels,
+                input_files,
+                bam_handles,
+                COVERAGE_PADDING,
+                MIN_DELETION_LENGTH,
+                MODS,
+                PYSAM_MOD_THRESHOLD,
+                MIN_GENE_OVERLAP
+            )
+
+            read_table = pandas.DataFrame(read_entries, columns=read_table_header)
+
+            # ------------------- CLUSTER PROCESSING (OPTIMIZED) ------------------- #
+            df = read_table.reset_index(drop=True).copy()
+            num_total_reads = len(df)
+
+            try:
+                if num_total_reads < MINIMUM_READS_TO_PROCESS:
+                    raise ValueError("not enough reads to process!")
+                # print("Number of total reads: {}".format(num_total_reads))
+
+                if MIN_CLUSTER_PERC is not None:
+                    min_cluster_size = max(MIN_CLUSTER_SIZE_BULK, int(numpy.ceil(MIN_CLUSTER_PERC * num_total_reads / len(bam_labels))))
+                    # print("USING MIN_CLUSTER_SIZE from PERC: {}: min_cluster_size = {}".format(MIN_CLUSTER_PERC, min_cluster_size))
+                else:
+                    min_cluster_size = MIN_CLUSTER_SIZE_BULK
+                    # print("USING MIN_CLUSTER_SIZE from BULK: min_cluster_size = {}".format(min_cluster_size))
+
+                # So for a gene you can cluster by continuous variables (euclidean distance) or by categorical features (Jaccard distance) or 
+                # by a combination of both (e.g. weighted sum of distances). The latter is experimental and may not work well, but it is possible to implement.
+                df_clustered, cluster_summary, dendrogram_data = run_pairwise_clustering(
+                    df, 
+                    CLUSTER_COLS, 
+                    min_cluster_size, 
+                    DISTANCE_THRESHOLD, 
+                    MIN_FEATURE_FREQ, 
+                    LIFT_THRESHOLD, 
+                    FEATURE_DISTANCE_THRESHOLD, 
+                    DISTANCE_METRIC, 
+                    LINKAGE_METHOD,
+                    PREDICT_COLUMN
+                )
+
+                for token in dendrogram_data["keep_tokens"]:
+                    feature_name, _, value = token.partition("_")
+                    if feature_name not in feature_bed_records:
+                        continue
+
+                    if feature_name == "introns":
+                        try:
+                            start, end = (int(coord) for coord in value.split("-", 1))
+                        except ValueError:
+                            continue
+                    else:
+                        try:
+                            start = int(value)
+                        except ValueError:
+                            continue
+                        end = start + 1
+
+                    region_type = classify_bed_interval(
+                        gff_df, row, feature_name, start, end
+                    )
+                    feature_bed_records[feature_name].add(
+                        (
+                            row["seq_id"],
+                            start,
+                            end,
+                            str(row["ID"]),
+                            row["strand"],
+                            region_type,
+                        )
+                    )
+
+                df_clustered["cluster"] = df_clustered["combined_primary_itemset"]
+
+                # ---------- tag cluster_summary with the same row_key used for ct, and accumulate ----------
+                cs = cluster_summary.copy()
+                cs["row_key"] = str(row["ID"]) + "_" + cs["cluster"].astype(str)
+
+                ct = (
+                    df_clustered
+                    .assign(row_key=lambda d: d["ID"].astype(str) + "_" + d["cluster"].astype(str))
+                    .groupby(["row_key", "label"])
+                    .size()
+                    .unstack(fill_value=0)
+                )
+
+                # ---------- optional UMAP only for visualization ----------
+                if len(matches) == 1:
+                    # UMAP_OUTPUT_DIR = "{}.umap".format(OUTPUT_DIR)
+                    # df_clustered.to_csv(UMAP_OUTPUT_DIR, sep="\t", index=False)
+                    # print("UMAP_OUTPUT_DIR")
+                    # print(f"Done. Wrote: {UMAP_OUTPUT_DIR}")
+
+                    # Write reads into cluster BAMs, keeping writers open so output
+                    # accumulates across all annotation rows in this run.
+                    # TODO: this should only write bam files if there isn't an insane amount of clusters
+
+                    print("Writing cluster BAMs...")
+                    for bam_label, bam_file in bam_handles.items():
+                        cluster_rows = df_clustered[df_clustered["label"] == bam_label]
+                        if cluster_rows.empty:
+                            continue
+
+                        read_to_cluster = (
+                            cluster_rows.drop_duplicates("read_id")
+                            .set_index("read_id")["cluster"]
+                            .to_dict()
+                        )
+
+                        ordered_clusters = sorted(
+                            set(read_to_cluster.values()),
+                            key=cluster_order_key,
+                        )
+
+                        if len(ordered_clusters) > 20:
+                            print(f"{bam_label} has {len(ordered_clusters)} cluster BAMs.")
+                            response = input(
+                                f"{bam_label} has {len(ordered_clusters)} cluster BAMs. Write them anyway? [y/N]: "
+                            ).strip().lower()
+                            if response not in {"y", "yes"}:
+                                print(f"Skipping BAM export for {bam_label}: {len(ordered_clusters)} clusters exceeds the 20-cluster limit.")
+                                continue
+
+                        cluster_file_names = {
+                            cluster: f"cluster{idx}"
+                            for idx, cluster in enumerate(ordered_clusters)
+                        }
+
+                        for cluster in ordered_clusters:
+                            cluster_key = (bam_label, cluster)
+                            if cluster_key not in cluster_bam_writers:
+                                output_path = os.path.join(
+                                    cluster_bam_directories[bam_label],
+                                    f"{cluster_file_names[cluster]}.bam",
+                                )
+                                cluster_bam_writers[cluster_key] = pysam.AlignmentFile(
+                                    output_path, "wb", template=bam_file
+                                )
+                                cluster_bam_read_ids[cluster_key] = set()
+
+                        # Fetch the region once per input BAM, then route each read
+                        # to its cluster instead of rescanning once per cluster.
+                        for read in bam_file.fetch(
+                            contig=row["seq_id"],
+                            start=max(0, row["start"] - COVERAGE_PADDING),
+                            stop=row["end"] + COVERAGE_PADDING,
+                        ):
+                            cluster = read_to_cluster.get(read.query_name)
+                            if cluster is None:
+                                continue
+
+                            cluster_key = (bam_label, cluster)
+                            if read.query_name in cluster_bam_read_ids[cluster_key]:
+                                continue
+
+                            # print(read)
+                            # print(read.modified_bases)
+
+                            # HACK: this is only necessary because igv.js isn't rendering mods properly, or allows control over specific mods to render.
+                            if CALL_MODS:
+                                wanted_codes = []
+                                for m in MODS:
+                                    wanted_codes.append(PYSAM_MOD_CODES[m + ("_for" if read.is_forward else "_rev")])
+
+                                mm = read.get_tag("MM")
+                                ml = list(read.get_tag("ML")) if read.has_tag("ML") else []
+
+                                groups = [g for g in mm.split(";") if g]
+
+                                new_groups = []
+                                new_ml = []
+                                idx = 0
+
+                                for group in groups:
+                                    header, *deltas = group.split(",")
+                                    n = len(deltas)
+                                    group_ml = ml[idx:idx + n]
+                                    idx += n
+
+                                    if header.strip(".") not in wanted_codes:
+                                        continue  # drop whole group + its ML slice
+
+                                    new_groups.append(group + ";")
+                                    new_ml.extend(q if q >= PYSAM_MOD_THRESHOLD else 0 for q in group_ml)
+
+
+                                if new_groups:
+                                    new_mm = "".join(new_groups)
+                                    new_ml = array.array("B", new_ml)
+                                    read.set_tag("MM", new_mm, value_type="Z")
+                                    read.set_tag("ML", array.array("B", new_ml))
+                                else:
+                                    read.set_tag("MM", None)
+                                    read.set_tag("ML", None)
+
+
+                            cluster_bam_writers[cluster_key].write(read)
+                            cluster_bam_read_ids[cluster_key].add(read.query_name)
+
+                    # TODO: plot coverage alongside dendrogram
+                    # I think we can just directly call with plot_coverage function using the newly written cluster BAMs.
+                    # This involves a bit of overhead of closing original BAMs and reopening them I guess, but the cluster BAM 
+                    # files will be fairly small so it's probably all good.
+
+                    # TODO: create new input_samples.txt in OUTPUT_DIR
+                    # TODO: simplify
+                    for bam_label in bam_labels:
+                        with open(os.path.join(OUTPUT_DIR, f"{bam_label}_cluster_bams/input_samples.txt"), "w") as f:
+                            ordered_cluster_entries = [
+                                (cluster_label, cluster_bam_writers[(bam_label, cluster_label)])
+                                for bam_label_inner, cluster_label in cluster_bam_writers
+                                if bam_label_inner == bam_label
+                            ]
+                            ordered_cluster_entries.sort(key=lambda item: cluster_order_key(item[0]))
+                            for cluster_label, writer in ordered_cluster_entries:
+                                cluster_entry = f"{cluster_label} control bam {os.fsdecode(writer.filename)}\n"
+                                f.write(cluster_entry)
+                                # print(cluster_entry.strip())
+
+            except ValueError as e:
+                print("ERROR:", e)
+                # fallback: one row ID_clusterNA with per-label counts
+                if df is None or df.empty:
+                    ct = pandas.DataFrame(index=[f"{row['ID']}_clusterNA"])
+                else:
+                    ct = (
+                        df.groupby("label")
+                        .size()
+                        .to_frame(name="n")
+                        .T
+                    )
+                    ct.index = [f"{row['ID']}_clusterNA"]
+
+                cs = pandas.DataFrame([{
+                    "cluster": "clusterNA",
+                    "n_samples": 0 if (df is None or df.empty) else len(df),
+                    "row_key": f"{row['ID']}_clusterNA",
+                }])
+
+            all_cluster_summaries.append(cs)
+            all_count_tables.append(ct)
+    finally:
+        for output_bam in cluster_bam_writers.values():
+            output_bam.close()
+        # Always close all handles
+        for fh in bam_handles.values():
+            fh.close()
+
+    # after loop: main combined table
+    main_count_table = (
+        pandas.concat(all_count_tables, axis=0)
+        .fillna(0)
+        .astype(int)
+        .sort_index()
+    )
+
+    # ---------- write ----------
+    out_df = main_count_table.rename_axis("ID_cluster").reset_index()
+    counts_table_output_path = "{}/counts_table.tsv".format(OUTPUT_DIR)
+    out_df.to_csv(counts_table_output_path, sep="\t", index=False)
+    print(f"Done. Wrote: {counts_table_output_path}")
+
+    # ---------- write cluster summaries, ordered the same as the count table ----------
+    main_cluster_summary = (
+        pandas.concat(all_cluster_summaries, axis=0)
+        .set_index("row_key")
+        .rename_axis("ID_cluster")
+        .reindex(main_count_table.index)   # same order as main_count_table
+        .reset_index()
+    )
+
+    CLUSTER_SUMMARY_OUTPUT_FILE = "{}/cluster_summary.tsv".format(OUTPUT_DIR)
+    main_cluster_summary.to_csv(CLUSTER_SUMMARY_OUTPUT_FILE, sep="\t", index=False)
+    print(f"Done. Wrote: {CLUSTER_SUMMARY_OUTPUT_FILE}")
+
+    for feature_name, records in feature_bed_records.items():
+        feature_bed = pandas.DataFrame(
+            sorted(records),
+            columns=["chrom", "start", "end", "gene_id", "strand", "region_type"],
+        )
+        feature_bed.insert(4, "score", ".")
+        feature_bed_output_path = os.path.join(OUTPUT_DIR, f"{feature_name}.bed")
+        feature_bed.to_csv(
+            feature_bed_output_path,
+            sep="\t",
+            header=False,
+            index=False,
+        )
+        print(f"Done. Wrote: {feature_bed_output_path}")
+
+    # Index finalized cluster BAMs and create an IGV Reports track config for
+    # each input BAM label.
+    tracks_by_label = {label: [] for label in bam_labels}
+    for bam_label in bam_labels:
+        for (stored_bam_label, cluster), output_bam in sorted(
+            [((label, cluster_name), writer) for (label, cluster_name), writer in cluster_bam_writers.items() if label == bam_label],
+            key=lambda item: cluster_order_key(item[0][1]),
+        ):
+            bam_path = os.fsdecode(output_bam.filename)
+            pysam.index(bam_path)
+
+            bam_filename = os.path.basename(bam_path)
+            tracks_by_label[bam_label].append({
+                "type": "alignment",
+                "format": "bam",
+                "showAlignments": SHOW_ALIGNMENTS,
+                "name": str(cluster),
+                "url": bam_filename,
+                "indexURL": f"{bam_filename}.bai",
+                "colorBy": "basemod",
+                "showCoverage": True,
+                # "groupBy": "strand",
+                "baseModificationThreshold": MOD_PROB_THRESHOLD,
+                "height": 200,
+                "displayMode": "squished",
+                "showMismatches": False,
+                "hideSmallIndels": True,
+                "indelSizeThreshold": 10,
+                "deletionColor": "rgb(170, 170, 170)"
+                # "insertionColor": "rgb(170, 170, 170)"
+            })
+
+    # Write the selected annotation region as BED6. GFF coordinates are
+    # 1-based inclusive; BED uses a 0-based half-open interval.
+    # TODO: add feature defining clusters to this file for ease of inspection in IGV reports
+    gene_bed = matches[["seq_id", "start", "end", "ID", "strand"]].copy()
+    gene_bed["start"] = gene_bed["start"] - 1
+    gene_bed.insert(4, "score", ".")
+
+    gene_bed_output_path = os.path.join(OUTPUT_DIR, "gene.bed")
+    gene_bed.to_csv(
+        gene_bed_output_path,
+        sep="\t",
+        header=False,
+        index=False,
+    )
+    print(f"Done. Wrote: {gene_bed_output_path}")
+
+    
+
+    for bam_label, tracks in tracks_by_label.items():
+        tracks_config_path = os.path.join(
+            cluster_bam_directories[bam_label], "tracksConfig.json"
+        )
+        with open(tracks_config_path, "w") as tracks_config_file:
+            json.dump(tracks, tracks_config_file, indent=2)
+            tracks_config_file.write("\n")
+
+        if GENERATE_IGV_REPORT:
+            igv_report_path = os.path.join(
+                cluster_bam_directories[bam_label], "igv_report.html"
+            )
+            report_cmd = [
+                "create_report",
+                gene_bed_output_path,
+                "--fasta",
+                GENOME_FILE,
+                "--track-config",
+                tracks_config_path,
+                "--tracks",
+                ANNOTATION_FILE,
+                "--output",
+                igv_report_path,
+            ]
+            subprocess.run(report_cmd, check=True)
+            print(f"Done. Wrote: {igv_report_path}")
+
+    # set parameters for plotting
+    if len(matches) == 1 and SHOW_DENDROGRAM:
+        # TODO: move dendrogram plotting to here, where it is currently save to file for plotting here
+        plot_cluster_dendrogram(
+            **dendrogram_data,
+            distance_threshold=DISTANCE_THRESHOLD,
+            hide_labels=HIDE_DENDROGRAM_LABELS,
+            delay_show=True,
+        )
+        plt.show()

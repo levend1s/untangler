@@ -1,0 +1,9 @@
+pandas
+numpy
+pysam
+scikit-learn
+scipy
+matplotlib
+statsmodels
+gffpandas
+igv-reports
