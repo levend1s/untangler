@@ -2,6 +2,13 @@
 import argparse
 import sys
 
+from untangler_modules import __version__
+
+
+def version():
+    """Print the installed untangler version."""
+    print(__version__)
+
 
 def parse_bool(value):
     if isinstance(value, bool):
@@ -20,8 +27,14 @@ from untangler_modules import cluster_transcripts
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="rqc",
-        description="RQC – a lightweight RNA-seq tool for transcript level analysis."
+        prog="untangler",
+        description="Untangler – cluster modBAM reads by transcript level features."
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=__version__,
+        help="show the installed untangler version and exit",
     )
 
     subparsers = parser.add_subparsers(

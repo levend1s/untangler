@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "untangler"
+dynamic = ["version"]
+description = "RNA-seq transcript-level analysis and clustering tool"
+readme = "README.md"
+license = "GPL-3.0-only"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas",
+    "numpy",
+    "pysam",
+    "scikit-learn",
+    "scipy",
+    "matplotlib",
+    "statsmodels",
+    "gffpandas",
+    "igv-reports",
+]
+
+[project.scripts]
+untangler = "untangler:main"
+
+[tool.setuptools]
+py-modules = ["untangler"]
+
+[tool.setuptools.dynamic]
+version = { attr = "untangler_modules.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["untangler_modules*"]

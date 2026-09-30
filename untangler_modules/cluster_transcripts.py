@@ -30,16 +30,6 @@ from statsmodels.stats.multitest import multipletests
 RANDOM_SEED = 42
 numpy.random.seed(RANDOM_SEED)
 
-def timeit(func):
-    @wraps(func)
-    def _wrapped(*args, **kwargs):
-        t0 = time.perf_counter()
-        res = func(*args, **kwargs)
-        t1 = time.perf_counter()
-        print(f"{func.__name__} took {t1-t0:.3f}s")
-        return res
-    return _wrapped
-
 def sanitize(tok):
     # keep names filesystem/column-friendly: no spaces, slashes, etc.
     return re.sub(r"[^0-9a-zA-Z_]+", "-", tok)
