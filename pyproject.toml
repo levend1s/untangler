@@ -9,6 +9,18 @@ description = "RNA-seq transcript-level analysis and clustering tool"
 readme = "README.md"
 license = "GPL-3.0-only"
 requires-python = ">=3.9"
+authors = [
+    { name = "Joshua Levendis" }
+]
+keywords = ["RNA-seq", "transcript analysis", "BAM", "bioinformatics"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     "pandas",
     "numpy",
@@ -21,6 +33,11 @@ dependencies = [
     "igv-reports",
 ]
 
+[project.urls]
+Homepage = "https://github.com/levend1s/untangler"
+Repository = "https://github.com/levend1s/untangler"
+Issues = "https://github.com/levend1s/untangler/issues"
+
 [project.scripts]
 untangler = "untangler:main"
 
@@ -32,23 +49,3 @@ version = { attr = "untangler_modules.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["untangler_modules*"]
-
-authors = [
-    { name = "Joshua Levendis" }
-]
-keywords = ["RNA-seq", "transcript analysis", "BAM", "bioinformatics"]
-
-classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
-    "Topic :: Scientific/Engineering :: Bio-Informatics",
-]
-
-[project.urls]
-Homepage = "https://github.com/levend1s/untangler"
-Repository = "https://github.com/levend1s/untangler"
-Issues = "https://github.com/levend1s/untangler/issues"
