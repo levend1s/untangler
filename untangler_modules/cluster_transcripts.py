@@ -372,6 +372,7 @@ def plot_cluster_dendrogram(
     unique_labels_arr,
     pattern_counts,
     cluster_names,
+    keep_tokens,
     distance_threshold,
     hide_labels=False,
     delay_show=False

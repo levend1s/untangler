@@ -356,6 +356,16 @@ plot_pvalue_histogram <- function(gene_sum) {
     theme_classic()
 }
 
+plot_shift_histogram <- function(gene_sum) {
+  d <- gene_sum[!is.na(gene_sum$shift), ]
+  ggplot(d, aes(x = shift)) +
+    geom_histogram(breaks = seq(0, 1, by = 0.02), colour = "white", fill = "steelblue") +
+    geom_hline(yintercept = nrow(d) * 0.02, linetype = "dashed", colour = "red") +
+    labs(x = "p-value", y = "Number of genes",
+         title = "Distribution of shift values") +
+    theme_classic()
+}
+
 plot_shift_vs_fdr <- function(gene_sum, fdr_cut = 0.05, shift_cut = 0.2) {
   gene_plot <- gene_sum[!is.na(gene_sum$FDR), ]
   gene_plot$negLogFDR <- -log10(gene_plot$FDR)
@@ -402,14 +412,14 @@ plot_shift_vs_fdr <- function(gene_sum, fdr_cut = 0.05, shift_cut = 0.2) {
 # ---- RUN ----
 # ============================================================
 
-counts_table    <- "/Users/joshualevendis/rqc/cluster_transcripts_28_introns/counts_table.tsv"
-cluster_summary <- "/Users/joshualevendis/rqc/cluster_transcripts_28_introns/cluster_summary.tsv"
+# counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_introns/counts_table.tsv"
+# cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_introns/cluster_summary.tsv"
 
 
-counts_table    <- "/Users/joshualevendis/rqc/cluster_transcripts_28_m6A/counts_table.tsv"
-cluster_summary <- "/Users/joshualevendis/rqc/cluster_transcripts_28_m6A/cluster_summary.tsv"
+counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_m6A/counts_table.tsv"
+cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_m6A/cluster_summary.tsv"
 
-annotation_file <- "~/Documents/RNA/honours/Pfalciparum3D7/gff/data/PlasmoDB-67_Pfalciparum3D7.gff"
+annotation_file <- "~/Downloads/Pfalciparum3D7/gff/data/PlasmoDB-67_Pfalciparum3D7.gff"
 
 counts  <- load_counts(counts_table)
 gene    <- sub("_cluster.*$", "", rownames(counts))
@@ -436,6 +446,7 @@ gene_table <- gene_sum[, c("gene", "n_subclusters", "reads_C", "reads_K",
 plotBCV(y)
 plot_depth_bias(gene_sum)
 plot_pvalue_histogram(gene_sum)
+plot_shift_histogram(gene_sum)
 
 # cool plots
 plot_top_shifted(gene_sum, prop_res)
@@ -444,4 +455,4 @@ plot_shift_vs_fdr(gene_sum)
 plot_subcluster_volcano(sub_hits)
 plot_shift_vs_cpm(gene_sum, y, gene)
 
-# inspect_gene("PF3D7_1006200", counts, gene, prop_res, gene_hits, simes_hits, sub_hits, gene_sum, ds)
+inspect_gene("PF3D7_0914400", counts, gene, prop_res, gene_hits, simes_hits, sub_hits, gene_sum, ds)

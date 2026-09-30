@@ -23,5 +23,5 @@ $ deactivate
 # Usage
 
 ```
-$ ID=PF3D7_1007900; python3 untangler.py cluster_transcripts --ids ${ID} -i laptop_samples_single.txt -o ./cluster_transcripts_${ID}_28 --cluster_cols introns,m6A --predict introns -t 0.6 -f --generate_igv_reports 
+$ ID=PF3D7_1007900; python3 untangler.py cluster_transcripts --ids ${ID} -i config.txt -o ./cluster_transcripts_${ID}_28 --cluster_cols introns,m6A --predict introns -t 0.6 -f --generate_igv_reports 
 ```
