@@ -216,8 +216,8 @@ plot_gene_props <- function(genes_vec, title, gene_sum, prop_res) {
   info <- gene_sum[match(genes_vec, gene_sum$gene), ]
   panel_lab <- paste0(info$gene,
                       "\nshift = ", sprintf("%.2f", info$shift),
-                      "\nF = ", ifelse(is.na(info$gene.F), "NA", sprintf("%.2f", info$gene.F))
-                      # ", FDR = ", ifelse(is.na(info$FDR), "NA", formatC(info$FDR, format = "e", digits = 1))
+                      "\nF = ", ifelse(is.na(info$gene.F), "NA", sprintf("%.2f", info$gene.F)),
+                      ", FDR = ", ifelse(is.na(info$FDR), "NA", formatC(info$FDR, format = "e", digits = 1))
   )
   names(panel_lab) <- info$gene
   
@@ -238,15 +238,85 @@ plot_gene_props <- function(genes_vec, title, gene_sum, prop_res) {
     theme(strip.text = element_text(size = 8))
 }
 
-plot_top_shifted <- function(gene_sum, prop_res, n = 12) {
-  top_genes <- head(gene_sum$gene, n)   # gene_sum is pre-sorted by shift, descending
-  plot_gene_props(top_genes, "Most shifted genes: subcluster usage in C vs K", gene_sum, prop_res)
+#' Top N genes by proportion shift (descending), or a custom gene list
+#'
+#' @param genes  Optional character vector of gene IDs. If supplied, these
+#'               genes are plotted (sorted by shift, descending) instead of
+#'               the automatic top-N selection, and `n` is ignored unless
+#'               the list is longer than it -- in which case it's truncated
+#'               to the top `n` *within the supplied list*.
+plot_top_shifted <- function(gene_sum, prop_res, n = 12, genes = NULL) {
+  if (!is.null(genes)) {
+    missing <- setdiff(genes, gene_sum$gene)
+    if (length(missing) > 0) {
+      message("Not found in gene_sum (skipped): ", paste(missing, collapse = ", "))
+    }
+    sel <- gene_sum[gene_sum$gene %in% genes, ]
+    sel <- sel[order(-sel$shift), ]
+    top_genes <- head(sel$gene, n)
+    title <- "Selected genes: subcluster usage in C vs K"
+  } else {
+    top_genes <- head(gene_sum$gene, n)   # gene_sum is pre-sorted by shift, descending
+    title <- "Most shifted genes: subcluster usage in C vs K"
+  }
+  plot_gene_props(top_genes, title, gene_sum, prop_res)
 }
 
-plot_least_shifted <- function(gene_sum, prop_res, n = 12, min_reads_stable = 100) {
-  stable <- gene_sum[pmin(gene_sum$reads_C, gene_sum$reads_K) >= min_reads_stable, ]
-  least_genes <- head(stable$gene[order(stable$shift)], n)
-  plot_gene_props(least_genes, "Least shifted genes: subcluster usage in C vs K", gene_sum, prop_res)
+#' Bottom N genes by proportion shift among well-covered genes, or a custom gene list
+#'
+#' @param genes  Optional character vector of gene IDs. If supplied, these
+#'               genes are plotted (sorted by shift, ascending) instead of
+#'               the automatic least-shifted selection; `min_reads_stable`
+#'               is ignored in that case since you've chosen the genes
+#'               explicitly.
+plot_least_shifted <- function(gene_sum, prop_res, n = 12, min_reads_stable = 100, genes = NULL) {
+  if (!is.null(genes)) {
+    missing <- setdiff(genes, gene_sum$gene)
+    if (length(missing) > 0) {
+      message("Not found in gene_sum (skipped): ", paste(missing, collapse = ", "))
+    }
+    sel <- gene_sum[gene_sum$gene %in% genes, ]
+    least_genes <- head(sel$gene[order(sel$shift)], n)
+    title <- "Selected genes: subcluster usage in C vs K"
+  } else {
+    stable <- gene_sum[pmin(gene_sum$reads_C, gene_sum$reads_K) >= min_reads_stable, ]
+    least_genes <- head(stable$gene[order(stable$shift)], n)
+    title <- "Least shifted genes: subcluster usage in C vs K"
+  }
+  plot_gene_props(least_genes, title, gene_sum, prop_res)
+}
+
+#' Plot an arbitrary list of genes, with no ranking/filtering applied at all
+#'
+#' Use this instead of plot_top_shifted()/plot_least_shifted() when the genes
+#' are chosen for some external reason (e.g. a predicted-m6A gene set) rather
+#' than by their proportion shift, and you don't want them reordered or capped.
+#'
+#' @param genes_vec  character vector of gene IDs, in the order you want them
+#'                   plotted (left to right, wrapping at `nrow`)
+#' @param title      plot title; defaults to a generic label if not supplied
+#' @param sort_by_shift  if TRUE, reorders genes_vec by shift (descending)
+#'                       before plotting instead of using the given order
+plot_selected_genes <- function(genes_vec, gene_sum, prop_res, title = NULL,
+                                sort_by_shift = FALSE) {
+  missing <- setdiff(genes_vec, gene_sum$gene)
+  if (length(missing) > 0) {
+    message("Not found in gene_sum (skipped): ", paste(missing, collapse = ", "))
+    genes_vec <- intersect(genes_vec, gene_sum$gene)
+  }
+  if (length(genes_vec) == 0) {
+    stop("None of the requested genes were found in gene_sum.")
+  }
+  
+  if (sort_by_shift) {
+    ord <- gene_sum$gene[gene_sum$gene %in% genes_vec]
+    ord <- ord[order(-gene_sum$shift[match(ord, gene_sum$gene)])]
+    genes_vec <- ord
+  }
+  
+  if (is.null(title)) title <- "Selected genes: subcluster usage in C vs K"
+  
+  plot_gene_props(genes_vec, title, gene_sum, prop_res)
 }
 
 # ============================================================
@@ -412,12 +482,15 @@ plot_shift_vs_fdr <- function(gene_sum, fdr_cut = 0.05, shift_cut = 0.2) {
 # ---- RUN ----
 # ============================================================
 
-# counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_introns/counts_table.tsv"
-# cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_introns/cluster_summary.tsv"
+counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_introns/counts_table.tsv"
+cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_introns/cluster_summary.tsv"
 
 
 counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_m6A/counts_table.tsv"
 cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28_m6A/cluster_summary.tsv"
+
+# cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28hpi/cluster_summary.tsv"
+# counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28hpi/counts_table.tsv"
 
 annotation_file <- "~/Downloads/Pfalciparum3D7/gff/data/PlasmoDB-67_Pfalciparum3D7.gff"
 
@@ -455,4 +528,11 @@ plot_shift_vs_fdr(gene_sum)
 plot_subcluster_volcano(sub_hits)
 plot_shift_vs_cpm(gene_sum, y, gene)
 
-inspect_gene("PF3D7_0914400", counts, gene, prop_res, gene_hits, simes_hits, sub_hits, gene_sum, ds)
+# inspect_gene("PF3D7_1249300", counts, gene, prop_res, gene_hits, simes_hits, sub_hits, gene_sum, ds)
+
+
+m6A_intron_predicted_genes <- c("PF3D7_0708400", "PF3D7_0832200", "PF3D7_0929000", "PF3D7_1249300", "PF3D7_0309000", "PF3D7_0715500", "PF3D7_1029300", "PF3D7_1326300", "PF3D7_0526200", 
+                                "PF3D7_0820600", "PF3D7_0924700", "PF3D7_1138350", "PF3D7_1231700", "PF3D7_1361500")
+
+# Option B: use the dedicated function for an arbitrary gene list, unranked
+plot_selected_genes(m6A_intron_predicted_genes, gene_sum, prop_res, title = "Predicted m6A intron genes: subcluster usage in C vs K")

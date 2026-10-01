@@ -12,14 +12,12 @@ annotation_file <- "~/Downloads/Pfalciparum3D7/gff/data/PlasmoDB-67_Pfalciparum3
 
 cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28hpi/cluster_summary.tsv"
 counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_28hpi/counts_table.tsv"
-# cluster_summary <- "/Users/joshualevendis/rqc/cluster_transcripts_28_predict_m6A/cluster_summary.tsv"
-# counts_table    <- "/Users/joshualevendis/rqc/cluster_transcripts_28_predict_m6A/counts_table.tsv"
 
-# cluster_summary <- "/Users/joshualevendis/rqc/cluster_transcripts_32hpi/cluster_summary.tsv"
-# counts_table    <- "/Users/joshualevendis/rqc/cluster_transcripts_32hpi/counts_table.tsv"
+cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_32hpi/cluster_summary.tsv"
+counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_32hpi/counts_table.tsv"
 
-# cluster_summary <- "/Users/joshualevendis/rqc/cluster_transcripts_36hpi/cluster_summary.tsv"
-# counts_table    <- "/Users/joshualevendis/rqc/cluster_transcripts_36hpi/counts_table.tsv"
+cluster_summary <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_36hpi/cluster_summary.tsv"
+counts_table    <- "/Users/jlevendis/Library/CloudStorage/OneDrive-TheUniversityofMelbourne/untangler_test/cluster_transcripts_36hpi/counts_table.tsv"
 
 # ==========================================================================
 # PLOT FUNCTIONS
