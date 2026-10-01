@@ -64,7 +64,6 @@ def build_parser():
     cluster_transcripts_parser.add_argument("--min_cluster_size_bulk", required=False, type=int, default=40, help="minimum number of reads to form a cluster (default: 100)")
     cluster_transcripts_parser.add_argument("--min_reads_to_process", required=False, type=int, default=40, help="minimum number of reads to process (default: 40)")
     cluster_transcripts_parser.add_argument("--distance_threshold", required=False, type=float, default=0.5, help="distance threshold for clustering (default: 0.1)")
-    cluster_transcripts_parser.add_argument("--show_dendrogram", action="store_true", help="if provided, show dendrogram of clustering results")
     cluster_transcripts_parser.add_argument("--min_feature_freq", required=False, type=float, default=0.1, help="minimum frequency of a feature to be considered for clustering (default: 0.01)")
     cluster_transcripts_parser.add_argument("--min_gene_overlap", required=False, type=float, default=0, help="minimum fraction of read overlapping gene to consider for clustering (default: 0.5)")
     cluster_transcripts_parser.add_argument("--lift_threshold", required=False, type=float, default=1.1, help="minimum lift score to consider a feature as a predictor of intron presence (default: 1.5)")

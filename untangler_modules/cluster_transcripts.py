@@ -365,7 +365,7 @@ def plot_cluster_dendrogram(
     keep_tokens,
     distance_threshold,
     hide_labels=False,
-    delay_show=False
+    output_dir=None
 ):
     """Plot a dendrogram from clustering results."""
     n_leaves = len(unique_rows)
@@ -432,8 +432,8 @@ def plot_cluster_dendrogram(
     )
     plt.xlabel("")
     plt.subplots_adjust(left=0.08, right=0.98, bottom=0.25, top=0.78)
-    if not delay_show:
-        plt.show()
+    if output_dir:
+        plt.savefig(f"{output_dir}/dendrogram.png", dpi=300, bbox_inches="tight")
 
 
 def evaluate_cluster_tokens_as_target_predictors(rows, cluster_important_tokens, target_prefix, min_count,
@@ -922,7 +922,6 @@ def cluster_transcripts(args):
     CALL_MODS = args.call_mods
     FORCE = args.force
     HIDE_DENDROGRAM_LABELS = args.hide_dendrogram_labels
-    SHOW_DENDROGRAM = args.show_dendrogram
     GENERATE_IGV_REPORT = args.generate_igv_reports
     SHOW_ALIGNMENTS = args.show_alignments
 
@@ -1472,12 +1471,11 @@ def cluster_transcripts(args):
             print(f"Done. Wrote: {igv_report_path}")
 
     # set parameters for plotting
-    if len(matches) == 1 and SHOW_DENDROGRAM:
+    if len(matches) == 1:
         # TODO: move dendrogram plotting to here, where it is currently save to file for plotting here
         plot_cluster_dendrogram(
             **dendrogram_data,
             distance_threshold=DISTANCE_THRESHOLD,
             hide_labels=HIDE_DENDROGRAM_LABELS,
-            delay_show=True,
+            output_dir=OUTPUT_DIR
         )
-        plt.show()
